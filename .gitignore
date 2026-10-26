@@ -1,0 +1,21 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment and secrets — never commit
+.env
+.env.*
+*.key
+*.pem
+
+# Local runtime state (approval queues, scratch runs, logs)
+*.local.jsonl
+dashboard-state/
+scratch-runs/
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
