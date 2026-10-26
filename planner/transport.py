@@ -6,13 +6,32 @@ configuration (``%USERPROFILE%\\.config\\muse\\auth.json``,
 machine, never printed and never logged.
 
 This transport therefore delegates the actual API call to the PC through
-a bridge CLI (``bridge.py ssh <host>``): a small
-PowerShell snippet runs ON the PC, reads the key locally, POSTs the chat
-completions payload to the Meta Model API and writes back ONLY the model's
-reply text. The payload travels base64-encoded inside the
-``-EncodedCommand`` script (UTF-16LE, the bridge's established encoding);
-the reply is decoded as UTF-8 with a cp1252 fallback (the PC console's
-native code page).
+a bridge CLI (``bridge.py ssh <host>``): PowerShell runs ON the PC, reads
+the key locally, POSTs the chat completions payload to the Meta Model API
+and writes back ONLY the model's reply text.
+
+Chunked deposit protocol — why: a single ``-EncodedCommand`` carrying
+script + payload blows the Windows command-line length limit (the remote
+command line is capped well under the 32 767 chars of CreateProcess —
+the first live attempt failed with "La ligne de commande est trop
+longue." at ~10.4k encoded chars). So the payload never rides inside a
+command line:
+
+1. The payload JSON is base64-encoded (UTF-8) here and deposited into a
+   unique temp file on the PC (``%TEMP%\\gab_payload_<token>.b64``) via
+   several SHORT bridge calls: the first chunk with
+   ``[IO.File]::WriteAllText``, the rest with ``AppendAllText``. Chunks
+   are 2000 base64 chars, so every encoded command stays ~5.7k chars —
+   far below the limit.
+2. ONE compact runner call, whose PowerShell contains NO payload: it
+   reads the temp file, decodes it, reads the credential from the local
+   Muse config, POSTs to ``/chat/completions``, prints ONLY the
+   assistant's reply text, and deletes the temp file (in a ``finally``).
+
+The key is used in the Authorization header and nowhere else — it is
+never written to any stream. PC hygiene: temp files only, always cleaned
+up (a best-effort delete also runs here if the sequence aborts); no
+scheduled tasks, no persistent script installs on the PC.
 
 The transport is a plain callable ``payload -> str`` so tests can inject
 a fake; the subprocess runner is injectable for the same reason.
@@ -39,6 +58,7 @@ import json
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 ENV_BRIDGE_HOST = "GAB_BRIDGE_HOST"
@@ -46,16 +66,42 @@ ENV_BRIDGE_PY = "GAB_BRIDGE_PY"
 DEFAULT_TIMEOUT_SECONDS = 180.0
 _MAX_ERROR_CHARS = 300
 
-# The PowerShell snippet executed on the PC. ``__BODY_B64__`` is replaced
-# with the base64 (UTF-8) chat-completions payload. The snippet reads the
+# Base64 chars of payload per deposit call. The chunk rides inside a
+# -EncodedCommand (UTF-16LE -> base64 inflates ~2.7x), so 2000 chars of
+# chunk keep the whole encoded command around ~5.7k chars, far below the
+# Windows command-line limit that killed the single-shot protocol.
+CHUNK_B64_CHARS = 2000
+
+_TEMP_PREFIX = "gab_payload_"
+_TEMP_SUFFIX = ".b64"
+
+# Deposit snippets executed on the PC. ``__FNAME__`` is the temp file
+# name (unique per call, hex token only — safe in a quoted literal) and
+# ``__CHUNK__`` one base64 slice (alphabet [A-Za-z0-9+/=], quote-safe).
+_PS_DEPOSIT_FIRST = """\
+$ErrorActionPreference = 'Stop'
+[IO.File]::WriteAllText((Join-Path $env:TEMP '__FNAME__'), '__CHUNK__')
+"""
+
+_PS_DEPOSIT_APPEND = """\
+$ErrorActionPreference = 'Stop'
+[IO.File]::AppendAllText((Join-Path $env:TEMP '__FNAME__'), '__CHUNK__')
+"""
+
+_PS_CLEANUP = """\
+Remove-Item (Join-Path $env:TEMP '__FNAME__') -ErrorAction SilentlyContinue
+"""
+
+# The runner snippet executed on the PC. It contains NO payload: it reads
+# the deposited temp file, decodes the chat-completions body, reads the
 # credential from the local Muse config, calls the API, and emits ONLY
 # the model's text on stdout; failures go to stderr with a stable prefix
-# and a non-zero exit code. The key is used in the Authorization header
-# and nowhere else — it is never written to any stream.
-_PS_SNIPPET = """\
+# and a non-zero exit code. The temp file is deleted in the finally.
+_PS_RUNNER = """\
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+$p = Join-Path $env:TEMP '__FNAME__'
 try {
   $authPath = Join-Path $env:USERPROFILE '.config\\muse\\auth.json'
   $cfg = Get-Content -Raw $authPath | ConvertFrom-Json
@@ -63,13 +109,16 @@ try {
   $base = $cfg.providers.meta.api_base_url
   if (-not $base) { $base = 'https://api.meta.ai/v1' }
   if (-not $key) { throw 'no Meta Model API credential in the Muse auth config' }
-  $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__BODY_B64__'))
+  $b64 = [IO.File]::ReadAllText($p)
+  $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
   $resp = Invoke-RestMethod -Method Post -Uri ($base.TrimEnd('/') + '/chat/completions') -Headers @{ Authorization = ('Bearer ' + $key) } -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body))
   $text = $resp.choices[0].message.content
   [Console]::Out.Write($text)
 } catch {
   [Console]::Error.Write('SPARK_BRIDGE_ERROR: ' + $_.Exception.Message)
   exit 1
+} finally {
+  Remove-Item $p -ErrorAction SilentlyContinue
 }
 """
 
@@ -124,12 +173,22 @@ def _sanitize_error(text: str) -> str:
     return " ".join(text.split())[:_MAX_ERROR_CHARS]
 
 
+def _encode_command(script: str) -> str:
+    """Encode a PowerShell script as a -EncodedCommand argument."""
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
 def _default_runner(argv: list[str], timeout: float):
     return subprocess.run(argv, capture_output=True, timeout=timeout)
 
 
 class BridgeSparkTransport:
-    """Callable transport: chat payload dict -> the model's reply text."""
+    """Callable transport: chat payload dict -> the model's reply text.
+
+    One call = N short deposit calls (payload chunks into a PC temp
+    file) + one payload-free runner call (PC-side API POST). See the
+    module docstring for the protocol and its rationale.
+    """
 
     def __init__(
         self,
@@ -143,21 +202,49 @@ class BridgeSparkTransport:
         self.timeout = timeout
         self.runner = runner if runner is not None else _default_runner
 
-    def build_argv(self, payload: dict) -> list[str]:
-        """Build the bridge CLI argv for one chat-completions payload."""
-        body_b64 = base64.b64encode(
-            json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        ).decode("ascii")
-        script = _PS_SNIPPET.replace("__BODY_B64__", body_b64)
-        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    # -- argv builders ---------------------------------------------------
+    def _argv(self, script: str) -> list[str]:
         return [
             sys.executable, str(self.bridge_path), "ssh", self.target, "--",
             "powershell", "-NoProfile", "-NonInteractive",
-            "-EncodedCommand", encoded,
+            "-EncodedCommand", _encode_command(script),
         ]
 
-    def __call__(self, payload: dict) -> str:
-        argv = self.build_argv(payload)
+    @staticmethod
+    def _temp_name(token: str) -> str:
+        return f"{_TEMP_PREFIX}{token}{_TEMP_SUFFIX}"
+
+    def build_deposit_argvs(self, payload: dict, token: str) -> list[list[str]]:
+        """One short bridge argv per payload chunk, in deposit order."""
+        body_b64 = base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        chunks = [
+            body_b64[i:i + CHUNK_B64_CHARS]
+            for i in range(0, len(body_b64), CHUNK_B64_CHARS)
+        ] or [""]
+        fname = self._temp_name(token)
+        argvs = []
+        for index, chunk in enumerate(chunks):
+            template = _PS_DEPOSIT_FIRST if index == 0 else _PS_DEPOSIT_APPEND
+            script = template.replace("__FNAME__", fname) \
+                             .replace("__CHUNK__", chunk)
+            argvs.append(self._argv(script))
+        return argvs
+
+    def build_runner_argv(self, token: str) -> list[str]:
+        """The single payload-free runner call for a deposited payload."""
+        script = _PS_RUNNER.replace("__FNAME__", self._temp_name(token))
+        return self._argv(script)
+
+    def build_cleanup_argv(self, token: str) -> list[str]:
+        """Best-effort temp-file delete, used when a sequence aborts."""
+        script = _PS_CLEANUP.replace("__FNAME__", self._temp_name(token))
+        return self._argv(script)
+
+    # -- execution -------------------------------------------------------
+    def _invoke(self, argv: list[str]):
+        """Run one bridge call; any failure -> SparkTransportError."""
         try:
             proc = self.runner(argv, self.timeout)
         except Exception as exc:  # timeout, missing bridge, ssh failure...
@@ -171,6 +258,27 @@ class BridgeSparkTransport:
                 f"bridge call failed (exit {proc.returncode})"
                 + (f": {detail}" if detail else "")
             )
+        return proc
+
+    def _cleanup(self, token: str) -> None:
+        """Best-effort temp-file removal; never raises."""
+        try:
+            self.runner(self.build_cleanup_argv(token),
+                        min(self.timeout, 30.0))
+        except Exception:
+            pass
+
+    def __call__(self, payload: dict) -> str:
+        token = uuid.uuid4().hex
+        try:
+            for argv in self.build_deposit_argvs(payload, token):
+                self._invoke(argv)
+            proc = self._invoke(self.build_runner_argv(token))
+        except SparkTransportError:
+            # The runner deletes the temp file itself when it runs; if
+            # the sequence aborted before/inside it, sweep from here.
+            self._cleanup(token)
+            raise
         text = _decode_console(proc.stdout or b"").lstrip("\ufeff").strip()
         if not text:
             raise SparkTransportError("empty reply from the Spark bridge call")

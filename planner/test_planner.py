@@ -220,6 +220,47 @@ class TestPlannerSelection(unittest.TestCase):
         self.assertIsInstance(planner, MockPlanner)
 
 
+class _FakePC:
+    """Simulates the PC side of the chunked deposit protocol.
+
+    Decodes each -EncodedCommand, applies WriteAllText/AppendAllText
+    deposits to an in-memory file store, answers the runner call with a
+    canned reply, and records every script for assertions.
+    """
+
+    _DEPOSIT_RE = re.compile(
+        r"(WriteAllText|AppendAllText)\(\(Join-Path \$env:TEMP "
+        r"'([^']+)'\), '([^']*)'\)")
+
+    def __init__(self, reply='{"steps": []}', fail_on=None):
+        self.reply = reply
+        self.fail_on = fail_on  # callable(script, call_number) -> bool
+        self.argvs: list[list[str]] = []
+        self.scripts: list[str] = []
+        self.files: dict[str, str] = {}
+
+    def __call__(self, argv, timeout):
+        self.argvs.append(argv)
+        script = base64.b64decode(argv[-1]).decode("utf-16-le")
+        self.scripts.append(script)
+        if self.fail_on is not None and self.fail_on(script, len(self.scripts)):
+            return SimpleNamespace(
+                returncode=1, stdout=b"",
+                stderr="SPARK_BRIDGE_ERROR: boom".encode("cp1252"))
+        deposit = self._DEPOSIT_RE.search(script)
+        if deposit:
+            kind, fname, chunk = deposit.groups()
+            if kind == "WriteAllText":
+                self.files[fname] = chunk
+            else:
+                self.files[fname] = self.files.get(fname, "") + chunk
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        if "/chat/completions" in script:
+            return SimpleNamespace(
+                returncode=0, stdout=self.reply.encode("utf-8"), stderr=b"")
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+
 class TestBridgeTransport(unittest.TestCase):
     def _transport(self, runner) -> BridgeSparkTransport:
         return BridgeSparkTransport(
@@ -227,45 +268,112 @@ class TestBridgeTransport(unittest.TestCase):
             runner=runner,
         )
 
-    def test_argv_carries_payload_and_pc_side_key_read(self):
-        captured = {}
+    @staticmethod
+    def _remote_command(argv) -> str:
+        """The command line as the PC receives it (post-ssh)."""
+        return " ".join(argv[5:])
 
-        def runner(argv, timeout):
-            captured["argv"] = argv
-            return SimpleNamespace(
-                returncode=0, stdout=b'{"steps": []}', stderr=b"")
-
-        transport = self._transport(runner)
-        payload = {"model": "muse-spark-1.3", "messages": []}
+    def test_chunked_deposit_round_trips_and_runner_is_payload_free(self):
+        pc = _FakePC()
+        transport = self._transport(pc)
+        # A payload large enough to force several deposit chunks.
+        marker = "payload-marker-" + "x" * 9000
+        payload = {"model": "muse-spark-1.3",
+                   "messages": [{"role": "user", "content": marker}]}
         reply = transport(payload)
 
         self.assertEqual(reply, '{"steps": []}')
-        argv = captured["argv"]
-        self.assertEqual(argv[1], "/fake/bridge.py")
-        self.assertEqual(argv[2:5], ["ssh", "bridge-host", "--"])
-        self.assertEqual(argv[5], "powershell")
-        self.assertEqual(argv[-2], "-EncodedCommand")
-        script = base64.b64decode(argv[-1]).decode("utf-16-le")
-        # The PC reads the credential locally; the key itself is nowhere.
-        self.assertIn("providers.meta.api_key", script)
-        self.assertIn("/chat/completions", script)
-        body_b64 = re.search(r"FromBase64String\('([^']+)'\)", script).group(1)
-        sent_payload = json.loads(base64.b64decode(body_b64).decode("utf-8"))
-        self.assertEqual(sent_payload, payload)
+        payload_b64 = base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        expected_chunks = -(-len(payload_b64) // 2000)
+        self.assertGreaterEqual(expected_chunks, 3)
 
-    def test_nonzero_exit_raises_transport_error(self):
-        def runner(argv, timeout):
-            return SimpleNamespace(
-                returncode=1, stdout=b"",
-                stderr="SPARK_BRIDGE_ERROR: API unreachable".encode("cp1252"))
+        # N deposit calls + exactly 1 runner call, in that order.
+        self.assertEqual(len(pc.scripts), expected_chunks + 1)
+        deposits, runner_script = pc.scripts[:-1], pc.scripts[-1]
+        chunks = []
+        fnames = set()
+        for index, script in enumerate(deposits):
+            match = _FakePC._DEPOSIT_RE.search(script)
+            self.assertIsNotNone(match)
+            kind, fname, chunk = match.groups()
+            self.assertEqual(
+                kind, "WriteAllText" if index == 0 else "AppendAllText")
+            fnames.add(fname)
+            chunks.append(chunk)
+            self.assertLessEqual(len(chunk), 2000)
+        self.assertEqual(len(fnames), 1)
+        fname = fnames.pop()
+        self.assertRegex(fname, r"^gab_payload_[0-9a-f]+\.b64$")
+
+        # Every single command stays far below the Windows limit.
+        for argv in pc.argvs:
+            self.assertEqual(argv[1], "/fake/bridge.py")
+            self.assertEqual(argv[2:5], ["ssh", "bridge-host", "--"])
+            self.assertEqual(argv[5], "powershell")
+            self.assertEqual(argv[-2], "-EncodedCommand")
+            self.assertLess(len(argv[-1]), 8000)
+            self.assertLess(len(self._remote_command(argv)), 8191)
+
+        # The deposited bytes round-trip byte-identically.
+        self.assertEqual("".join(chunks), payload_b64)
+        self.assertEqual(
+            base64.b64decode(pc.files[fname]),
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+        # The runner call embeds NO payload: it reads the temp file and
+        # the PC-side credential, posts, and deletes the temp file.
+        self.assertIn(fname, runner_script)
+        self.assertIn("providers.meta.api_key", runner_script)
+        self.assertIn("/chat/completions", runner_script)
+        self.assertIn("ReadAllText", runner_script)
+        self.assertIn("Remove-Item", runner_script)
+        self.assertNotIn(marker, runner_script)
+        for chunk in chunks:
+            self.assertNotIn(chunk[:64], runner_script)
+
+    def test_small_payload_uses_one_deposit_and_one_runner(self):
+        pc = _FakePC()
+        reply = self._transport(pc)({"model": "muse-spark-1.3",
+                                     "messages": []})
+        self.assertEqual(reply, '{"steps": []}')
+        self.assertEqual(len(pc.scripts), 2)
+        self.assertIn("WriteAllText", pc.scripts[0])
+        self.assertIn("/chat/completions", pc.scripts[1])
+
+    def test_deposit_failure_raises_and_cleans_up(self):
+        pc = _FakePC(fail_on=lambda script, n: n == 2)
+        payload = {"model": "muse-spark-1.3",
+                   "messages": [{"role": "user", "content": "y" * 9000}]}
+        with self.assertRaises(SparkTransportError) as ctx:
+            self._transport(pc)(payload)
+        self.assertIn("boom", str(ctx.exception))
+        # Deposit #1 ok, deposit #2 failed, then a cleanup call for the
+        # same temp file (Remove-Item, and NOT the API runner).
+        self.assertEqual(len(pc.scripts), 3)
+        cleanup = pc.scripts[-1]
+        self.assertIn("Remove-Item", cleanup)
+        self.assertNotIn("/chat/completions", cleanup)
+        fname = _FakePC._DEPOSIT_RE.search(pc.scripts[0]).group(2)
+        self.assertIn(fname, cleanup)
+
+    def test_runner_nonzero_exit_raises_transport_error(self):
+        pc = _FakePC(
+            fail_on=lambda script, n: "/chat/completions" in script)
 
         with self.assertRaises(SparkTransportError) as ctx:
-            self._transport(runner)({"model": "muse-spark-1.3"})
-        self.assertIn("API unreachable", str(ctx.exception))
+            self._transport(pc)({"model": "muse-spark-1.3"})
+        self.assertIn("boom", str(ctx.exception))
 
     def test_runner_failure_raises_transport_error(self):
+        pc = _FakePC()
+
         def runner(argv, timeout):
-            raise subprocess.TimeoutExpired(cmd="ssh", timeout=timeout)
+            script = base64.b64decode(argv[-1]).decode("utf-16-le")
+            if "/chat/completions" in script:
+                raise subprocess.TimeoutExpired(cmd="ssh", timeout=timeout)
+            return pc(argv, timeout)
 
         with self.assertRaises(SparkTransportError):
             self._transport(runner)({"model": "muse-spark-1.3"})
