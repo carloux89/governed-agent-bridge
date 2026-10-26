@@ -2,6 +2,8 @@
 
 **Your agent. Your PC. Your rules.**
 
+Developed by **Carl Cloutier**.
+
 An installable bridge that lets an AI agent work on your own PC under your
 governance: every sensitive action is proposed, justified, and approved by
 you first — and everything the agent does is recorded in a tamper-evident
@@ -20,6 +22,8 @@ Task (desktop terminal)
   -> Executor (runs only what is allowed or approved)
   -> Hash-chained audit log -> Viewer ("Verify the chain" in one click)
 ```
+
+Built with **Muse Spark** via the Meta Model API.
 
 | Component | Plan section | Status in this repo |
 |---|---|---|
