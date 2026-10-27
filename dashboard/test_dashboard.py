@@ -4,6 +4,7 @@ The server is started on an ephemeral loopback port; requests go through
 urllib against 127.0.0.1 only.
 """
 
+import errno
 import shutil
 import tempfile
 import threading
@@ -17,6 +18,31 @@ from auditlog.chain import AuditLog
 from dashboard.server import DashboardState, make_server
 
 
+def _make_server_or_skip(state, server_factory=make_server):
+    """Start the dashboard server for a test.
+
+    Some sandboxed environments forbid binding even a loopback socket
+    (``PermissionError: [Errno 1] Operation not permitted``). That is an
+    environment limitation, not a product failure: declare the test
+    skipped with an explicit reason instead of erroring. Any other
+    ``OSError`` still propagates as a real error. When binding is
+    permitted the real server is returned and the tests exercise real
+    HTTP, unchanged.
+    """
+    try:
+        return server_factory(state, port=0)
+    except OSError as exc:
+        if isinstance(exc, PermissionError) or exc.errno in (
+            errno.EPERM,
+            errno.EACCES,
+        ):
+            raise unittest.SkipTest(
+                "socket binding not permitted in this environment "
+                f"({exc})"
+            ) from exc
+        raise
+
+
 class DashboardTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="gab-dash-test-"))
@@ -24,7 +50,11 @@ class DashboardTestBase(unittest.TestCase):
         self.queue = ApprovalQueue()
         self.state = DashboardState(queue=self.queue,
                                     audit_log_path=self.audit_path)
-        self.server = make_server(self.state, port=0)
+        try:
+            self.server = _make_server_or_skip(self.state)
+        except unittest.SkipTest:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            raise
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever,
                                        daemon=True)
@@ -111,6 +141,48 @@ class TestDashboard(DashboardTestBase):
         self.assertIn("Chain BROKEN at entry #1", body)
         self.assertIn("hash_mismatch", body)
         self.assertIn("class='broken'", body)
+
+
+class TestServerBindGuard(unittest.TestCase):
+    """The bind guard: permission failures become explicit skips,
+    everything else still surfaces as an error."""
+
+    def _state(self):
+        return DashboardState(queue=ApprovalQueue(),
+                              audit_log_path=Path("unused.jsonl"))
+
+    @staticmethod
+    def _raising(exc):
+        def factory(state, port=0):
+            raise exc
+        return factory
+
+    def test_permission_error_becomes_skip_with_reason(self):
+        factory = self._raising(
+            PermissionError(errno.EPERM, "Operation not permitted"))
+        with self.assertRaises(unittest.SkipTest) as ctx:
+            _make_server_or_skip(self._state(), server_factory=factory)
+        self.assertIn("socket binding not permitted", str(ctx.exception))
+
+    def test_oserror_with_eperm_errno_becomes_skip(self):
+        exc = OSError("Operation not permitted")
+        exc.errno = errno.EPERM  # bypasses the PermissionError subclassing
+        with self.assertRaises(unittest.SkipTest):
+            _make_server_or_skip(self._state(),
+                                 server_factory=self._raising(exc))
+
+    def test_other_oserrors_still_propagate(self):
+        exc = OSError(errno.EADDRINUSE, "Address already in use")
+        with self.assertRaises(OSError) as ctx:
+            _make_server_or_skip(self._state(),
+                                 server_factory=self._raising(exc))
+        self.assertNotIsInstance(ctx.exception, unittest.SkipTest)
+
+    def test_successful_bind_returns_the_server(self):
+        sentinel = object()
+        result = _make_server_or_skip(
+            self._state(), server_factory=lambda state, port=0: sentinel)
+        self.assertIs(result, sentinel)
 
 
 if __name__ == "__main__":

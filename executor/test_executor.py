@@ -13,14 +13,12 @@ from pathlib import Path
 
 from approvals.engine import ApprovalQueue
 from auditlog.chain import AuditLog, verify_chain
+from dossier import resolve_dossier_dir
 from executor.executor import Executor
 from executor.sandbox import Sandbox, SandboxEscape
 from planner.planner import MockPlanner
 
-DOSSIER_DIR = (
-    Path(__file__).resolve().parents[3]
-    / "files" / "dossier-synthetique-SYN-2026-001"
-)
+DOSSIER_DIR = resolve_dossier_dir()
 DOSSIER_FILES = [
     "01-courriel-attribution.md",
     "02-offre-bail-fictive.md",

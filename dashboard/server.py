@@ -38,14 +38,12 @@ from urllib.parse import parse_qs, quote, urlparse
 
 from approvals.engine import ApprovalQueue, ProposalExpired, Status
 from auditlog.chain import AuditLog, verify_chain
+from dossier import resolve_dossier_dir
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 
-DOSSIER_DIR = (
-    Path(__file__).resolve().parents[3]
-    / "files" / "dossier-synthetique-SYN-2026-001"
-)
+DOSSIER_DIR = resolve_dossier_dir()
 DOSSIER_FILES = [
     "01-courriel-attribution.md",
     "02-offre-bail-fictive.md",

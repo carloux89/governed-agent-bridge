@@ -18,15 +18,17 @@ only. Usage::
 from __future__ import annotations
 
 import shutil
+import tempfile
 from pathlib import Path
 
 from approvals.engine import ApprovalQueue
 from auditlog.chain import AuditLog, verify_chain
+from dossier import resolve_dossier_dir
 from executor.executor import Executor
 from planner.planner import planner_from_env
 
 BUILD_ROOT = Path(__file__).resolve().parent
-DOSSIER_DIR = BUILD_ROOT.parent.parent / "files" / "dossier-synthetique-SYN-2026-001"
+DOSSIER_DIR = resolve_dossier_dir()
 RUN_DIR = BUILD_ROOT / "runs" / "SYN-2026-001"
 DOSSIER_FILES = [
     "01-courriel-attribution.md",
@@ -41,12 +43,23 @@ TASK = (
 
 
 def main() -> None:
-    if RUN_DIR.exists():
-        shutil.rmtree(RUN_DIR)
-    sandbox_root = RUN_DIR / "sandbox"
-    sandbox_root.mkdir(parents=True)
-    for name in DOSSIER_FILES:
-        shutil.copyfile(DOSSIER_DIR / name, sandbox_root / name)
+    # Stage the seed dossier BEFORE wiping RUN_DIR: in a standalone clone
+    # the canonical dossier lives inside RUN_DIR itself
+    # (runs/SYN-2026-001/sandbox), so copying after the wipe would find
+    # nothing. The staged copies are byte-identical seeds; the run's
+    # outputs are unchanged.
+    staging = Path(tempfile.mkdtemp(prefix="gab-demo-seed-"))
+    try:
+        for name in DOSSIER_FILES:
+            shutil.copyfile(DOSSIER_DIR / name, staging / name)
+        if RUN_DIR.exists():
+            shutil.rmtree(RUN_DIR)
+        sandbox_root = RUN_DIR / "sandbox"
+        sandbox_root.mkdir(parents=True)
+        for name in DOSSIER_FILES:
+            shutil.copyfile(staging / name, sandbox_root / name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     audit_path = RUN_DIR / "audit-log.jsonl"
     audit_log = AuditLog(audit_path)
