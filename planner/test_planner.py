@@ -19,7 +19,11 @@ from planner.planner import (
     SparkPlanner,
     planner_from_env,
 )
-from planner.transport import BridgeSparkTransport, SparkTransportError
+from planner.transport import (
+    BridgeSparkTransport,
+    SparkTransportError,
+    repair_mojibake,
+)
 
 DEMO_TASK = (
     "Prépare le dossier SYN-2026-001 : échéances, liste de documents, "
@@ -232,9 +236,17 @@ class _FakePC:
         r"(WriteAllText|AppendAllText)\(\(Join-Path \$env:TEMP "
         r"'([^']+)'\), '([^']*)'\)")
 
-    def __init__(self, reply='{"steps": []}', fail_on=None):
+    def __init__(self, reply='{"steps": []}', fail_on=None,
+                 reply_transform=None, raw_stdout=None):
         self.reply = reply
         self.fail_on = fail_on  # callable(script, call_number) -> bool
+        # reply_transform: mangling applied to the reply string on the
+        # PC side before it is put on the wire (e.g. a cp1252 round trip
+        # producing mojibake), to prove the reception-side guard.
+        self.reply_transform = reply_transform
+        # raw_stdout: bytes returned verbatim by the runner call,
+        # bypassing the base64 reply channel entirely.
+        self.raw_stdout = raw_stdout
         self.argvs: list[list[str]] = []
         self.scripts: list[str] = []
         self.files: dict[str, str] = {}
@@ -256,8 +268,17 @@ class _FakePC:
                 self.files[fname] = self.files.get(fname, "") + chunk
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
         if "/chat/completions" in script:
+            if self.raw_stdout is not None:
+                return SimpleNamespace(
+                    returncode=0, stdout=self.raw_stdout, stderr=b"")
+            wire = self.reply
+            if self.reply_transform is not None:
+                wire = self.reply_transform(wire)
+            # The real runner emits base64 of the reply's UTF-8 bytes.
             return SimpleNamespace(
-                returncode=0, stdout=self.reply.encode("utf-8"), stderr=b"")
+                returncode=0,
+                stdout=base64.b64encode(wire.encode("utf-8")),
+                stderr=b"")
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
 
@@ -329,6 +350,12 @@ class TestBridgeTransport(unittest.TestCase):
         self.assertIn("/chat/completions", runner_script)
         self.assertIn("ReadAllText", runner_script)
         self.assertIn("Remove-Item", runner_script)
+        # The reply channel is bytes, not console text: raw response
+        # bytes decoded as UTF-8 on the PC, reply emitted as base64.
+        self.assertIn("UploadData", runner_script)
+        self.assertIn("ToBase64String", runner_script)
+        self.assertIn("UTF8.GetString", runner_script)
+        self.assertNotIn("Invoke-RestMethod", runner_script)
         self.assertNotIn(marker, runner_script)
         for chunk in chunks:
             self.assertNotIn(chunk[:64], runner_script)
@@ -412,6 +439,65 @@ class TestBridgeTransport(unittest.TestCase):
                 runner=lambda argv, timeout: None)
         self.assertEqual(transport.bridge_path, Path("/arg/bridge.py"))
         self.assertEqual(transport.target, "arg-host")
+
+
+class TestReplyChannelEncoding(unittest.TestCase):
+    """The reply channel carries bytes (base64 of UTF-8), never console
+    text, and a guarded repair at reception undoes any residual
+    UTF-8-decoded-as-cp1252 double-encoding (the live mojibake bug:
+    "RÃ©dige" instead of "Rédige")."""
+
+    FRENCH_REPLY = (
+        '{"steps": [{"step": 1, "action": "read_document", '
+        '"risk_class": "read", "params": {}, '
+        '"justification": "Rédige le résumé : échéances, pièces '
+        'clés, déjà vérifiées."}]}'
+    )
+
+    def _transport(self, runner) -> BridgeSparkTransport:
+        return BridgeSparkTransport(
+            bridge_path="/fake/bridge.py", target="bridge-host",
+            runner=runner,
+        )
+
+    def test_accents_survive_the_base64_reply_channel(self):
+        pc = _FakePC(reply=self.FRENCH_REPLY)
+        reply = self._transport(pc)({"model": "muse-spark-1.3"})
+        self.assertEqual(reply, self.FRENCH_REPLY)
+        self.assertNotIn("Ã", reply)
+
+    def test_mojibake_reply_is_repaired_at_reception(self):
+        """Even if the PC-side string is already double-encoded, the
+        faithful base64 channel transports it as-is and the guarded
+        reception repair restores the accents before validation."""
+        def mangle(text):
+            return text.encode("utf-8").decode("cp1252")
+
+        pc = _FakePC(reply=self.FRENCH_REPLY, reply_transform=mangle)
+        reply = self._transport(pc)({"model": "muse-spark-1.3"})
+        self.assertEqual(reply, self.FRENCH_REPLY)
+
+    def test_non_base64_reply_fails_closed(self):
+        pc = _FakePC(raw_stdout="plain console text, not base64!"
+                     .encode("utf-8"))
+        with self.assertRaises(SparkTransportError) as ctx:
+            self._transport(pc)({"model": "muse-spark-1.3"})
+        self.assertIn("base64", str(ctx.exception))
+
+    def test_repair_mojibake_fixes_double_encoding(self):
+        clean = "Rédige le résumé — échéances et pièces clés, déjà là."
+        mangled = clean.encode("utf-8").decode("cp1252")
+        self.assertIn("Ã", mangled)
+        self.assertEqual(repair_mojibake(mangled), clean)
+
+    def test_repair_mojibake_leaves_clean_text_untouched(self):
+        for text in (
+            "Rédige le résumé — échéances, pièces clés, déjà vérifiées.",
+            "Plain ASCII plan, no accents at all.",
+            "São Paulo — a legitimate tilde is not mojibake.",
+            "L'agent propose, l'humain dispose.",
+        ):
+            self.assertEqual(repair_mojibake(text), text)
 
 
 if __name__ == "__main__":

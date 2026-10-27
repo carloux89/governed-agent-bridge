@@ -25,8 +25,22 @@ command line:
    far below the limit.
 2. ONE compact runner call, whose PowerShell contains NO payload: it
    reads the temp file, decodes it, reads the credential from the local
-   Muse config, POSTs to ``/chat/completions``, prints ONLY the
-   assistant's reply text, and deletes the temp file (in a ``finally``).
+   Muse config, POSTs to ``/chat/completions``, prints the assistant's
+   reply as BASE64 of its UTF-8 bytes, and deletes the temp file (in a
+   ``finally``).
+
+The reply channel is deliberately BYTES, not console text. Windows
+PowerShell 5.1 decodes an HTTP response body with the legacy ANSI code
+page when the response declares no charset, and console output can be
+re-encoded the same way on its way back — in the first live runs a
+French justification arrived double-encoded ("RÃ©dige" for
+"Rédige"): UTF-8 bytes read as cp1252, then re-encoded as UTF-8. The
+runner therefore moves bytes end to end (raw response bytes decoded
+explicitly as UTF-8 on the PC; the reply returned as base64), and a
+guarded repair at reception (see :func:`repair_mojibake`) undoes any
+residual double-encoding BEFORE the plan is validated or journalised.
+The audit log only ever stores the repaired text — the repair happens
+at reception, never by rewriting a journal after the fact.
 
 The key is used in the Authorization header and nowhere else — it is
 never written to any stream. PC hygiene: temp files only, always cleaned
@@ -56,6 +70,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -95,8 +110,13 @@ Remove-Item (Join-Path $env:TEMP '__FNAME__') -ErrorAction SilentlyContinue
 # The runner snippet executed on the PC. It contains NO payload: it reads
 # the deposited temp file, decodes the chat-completions body, reads the
 # credential from the local Muse config, calls the API, and emits ONLY
-# the model's text on stdout; failures go to stderr with a stable prefix
-# and a non-zero exit code. The temp file is deleted in the finally.
+# the model's reply — base64 of its UTF-8 bytes — on stdout; failures go
+# to stderr with a stable prefix and a non-zero exit code. The temp file
+# is deleted in the finally. The POST deliberately goes through
+# Net.WebClient so the response comes back as raw bytes that this
+# snippet decodes as UTF-8 itself: Invoke-RestMethod on Windows
+# PowerShell 5.1 decodes a charset-less JSON body with the ANSI code
+# page, which is exactly how the accents were mangled in the first runs.
 _PS_RUNNER = """\
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -111,9 +131,13 @@ try {
   if (-not $key) { throw 'no Meta Model API credential in the Muse auth config' }
   $b64 = [IO.File]::ReadAllText($p)
   $body = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
-  $resp = Invoke-RestMethod -Method Post -Uri ($base.TrimEnd('/') + '/chat/completions') -Headers @{ Authorization = ('Bearer ' + $key) } -ContentType 'application/json' -Body ([Text.Encoding]::UTF8.GetBytes($body))
+  $wc = New-Object Net.WebClient
+  $wc.Headers.Add('Authorization', ('Bearer ' + $key))
+  $wc.Headers.Add('Content-Type', 'application/json')
+  $respBytes = $wc.UploadData(($base.TrimEnd('/') + '/chat/completions'), [Text.Encoding]::UTF8.GetBytes($body))
+  $resp = ([Text.Encoding]::UTF8.GetString($respBytes)) | ConvertFrom-Json
   $text = $resp.choices[0].message.content
-  [Console]::Out.Write($text)
+  [Console]::Out.Write([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($text)))
 } catch {
   [Console]::Error.Write('SPARK_BRIDGE_ERROR: ' + $_.Exception.Message)
   exit 1
@@ -167,6 +191,55 @@ def _decode_console(data: bytes) -> str:
         return data.decode("utf-8")
     except UnicodeDecodeError:
         return data.decode("cp1252", errors="replace")
+
+
+# Markers of UTF-8 bytes that were decoded as cp1252 somewhere along the
+# way: "Ã" followed by a Latin-1 character (é -> "Ã©", è -> "Ã¨",
+# clés -> "clÃ©s") and the "â€" prefix of mangled punctuation
+# (a curly quote's E2 80 99 -> "â€™").
+_MOJIBAKE_HINT = re.compile(r"Ã[\u0080-\u00ff]|â€")
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo one UTF-8-decoded-as-cp1252 round trip, conservatively.
+
+    Applied at RECEPTION, before the plan is validated or anything is
+    journalised — never as a post-hoc rewrite of an audit log. The
+    repair fires ONLY when mojibake markers are present AND the
+    cp1252 -> UTF-8 round trip succeeds AND it strictly reduces the
+    marker count. Clean text — including text that legitimately
+    contains accented characters — is returned untouched.
+    """
+    markers = len(_MOJIBAKE_HINT.findall(text))
+    if markers == 0:
+        return text
+    try:
+        repaired = text.encode("cp1252").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+    if len(_MOJIBAKE_HINT.findall(repaired)) < markers:
+        return repaired
+    return text
+
+
+def _decode_reply(stdout: bytes) -> str:
+    """Decode the runner's reply channel: base64 of UTF-8 bytes.
+
+    The runner emits ONLY base64 (pure ASCII), so no console code page
+    between the PC and this process can corrupt the content in
+    transit. Anything that is not valid base64-of-UTF-8 is a transport
+    failure — fail closed, the planner will record the fallback.
+    """
+    channel = _decode_console(stdout or b"").lstrip("\ufeff")
+    compact = "".join(channel.split())
+    try:
+        raw = base64.b64decode(compact, validate=True)
+        return raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SparkTransportError(
+            "reply channel decode failed (expected base64 of UTF-8): "
+            f"{type(exc).__name__}"
+        ) from exc
 
 
 def _sanitize_error(text: str) -> str:
@@ -279,7 +352,7 @@ class BridgeSparkTransport:
             # the sequence aborted before/inside it, sweep from here.
             self._cleanup(token)
             raise
-        text = _decode_console(proc.stdout or b"").lstrip("\ufeff").strip()
+        text = repair_mojibake(_decode_reply(proc.stdout or b"")).strip()
         if not text:
             raise SparkTransportError("empty reply from the Spark bridge call")
         return text
